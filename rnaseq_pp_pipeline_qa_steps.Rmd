@@ -1,0 +1,388 @@
+---
+title: "RNASeq: Pre-Processing Pipeline for Machine Learning Classification"
+author: "Ed Parkinson"
+date: "19/04/2022"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+### Code shared with Tabitha  - this is subset of full RNA-Seq pre-processing pipeline
+### Only focused on outlier sample identification
+
+============================================================================================================
+##################################### Load Libraries and Working Directory #################################
+============================================================================================================
+
+```{r setup, include=FALSE, echo=FALSE}
+
+## set working directory to the folder where the rmd code file is stored [could be updated using Here package, but need to figure out]
+setwd("/Users/ep/Documents/1_datasets/dataset_pearth/an0304/bin")
+
+#library(here)
+library(tidyverse)
+library(purrr)
+library(DESeq2)       # differential expression analysis
+library(limma)
+library(ggplot2)      # plotting
+library(reshape2)     # data manipulation, including melt function
+library(ggrepel)      # chart labelling
+library(dplyr)        # data manipulations
+library(docstring)    # docstring information
+library(pheatmap)     # heatmaps
+library(RColorBrewer) # heatmaps
+library(dgof)         # required package for Kolmogorov-Smirnov statistic Ka
+library(Hmisc)        # for Hoeffding's D statistic for MA plots
+#library(HTSFilter)    # for independent filtering with HTS approach
+library(scales)
+#library(KneeArrower)  # used for finding elbow of a curve. see source in knee_arrover_code.R. Should reproduce with minimal code required.
+library(stats)
+library(matrixStats)  # used for variance statistics function with rowVars, rowMedians
+
+# source functions contained in scripts
+
+source("scr/scale_transform.R")
+source("scr/pca_analysis.R")
+source("scr/l1_distance.R")
+source("scr/rel_distribution.R")
+source("scr/assay_quality_ma_d.R")
+
+```
+
+========================================= file save paths  ==================================================
+
+```{r}
+
+# set path for saving output types
+
+figs.path <- "../figs/v2/"
+data.path <- "../output/v2/"
+
+```
+
+============================================================================================================
+############################################## Raw Data Import  ############################################
+============================================================================================================
+
+Notes:
+
+countsData is a matrix of counts, with samples as columns, and genes as row names
+targets.csv is a csv file with phenotypical data, e.g. condition, and other clinical information on each sample
+Customisation is likely needed in this section to import and form the relevant variables in the specific data set
+
+```{r import raw data}
+## read input counts data and extract gene lengths as dataframe and keep annotation columns
+
+countsData <- read.table(paste("../input/uber/all.markdup.genecount.txt", sep=""), sep="\t", header=TRUE, check.names=F)
+geneLengths <- dplyr::select(countsData, ensemblGeneID, geneLength)
+annotationNames <- countsData[,c(1:4)]
+annotationNames <- annotationNames %>%  rename('ensemblGeneID' = 'ensemblID')
+
+# add rownames to the raw data using ensemblID as the index, and remove all four annotation columns
+rownames(countsData) = countsData[,1]
+countsData[,c(1:4)] <- NULL
+
+## read targets file, make sure in same order as the counts data and convert to factors
+targets.raw <- read.table("../resources/targets.csv", sep=",", header=T)
+
+targets <- targets.raw %>% dplyr::select('analysisID',
+                                     'condition',
+                                     'library_batch',
+                                     'Treatment_Mar22',
+                                     'ga_days',
+                                     'bw',
+                                     'sex',
+                                     'bacteria_1',
+                                     'bacteria_2',
+                                     'bc_bacteria',
+                                     'age_ga_plus_pna_days',
+                                     'bc_pna',
+                                     'pre_protect_rna_blood_volume_ul',
+                                     'rin_value_below_6',
+                                     'topUps',
+                                     'counts_batch'
+                                    ) %>% 
+  
+                        dplyr::rename(condition_original = Treatment_Mar22,
+                                      rna_blood_volume = pre_protect_rna_blood_volume_ul,
+                                      gest_age_days = ga_days,
+                                      age_corrected = age_ga_plus_pna_days,
+                                      birth_weight_g = bw,
+                                      gram_pos_neg = bc_bacteria
+                                    )
+
+targets <- targets[match(colnames(countsData), targets$analysisID),]
+if(!identical(targets$analysisID,colnames(countsData))) { stop() } # check the column names match
+
+col_names <- names(targets)    # get all the column names
+col_names <- col_names[! col_names %in% c('analysisID', 'gest_age_days', 'birth_weight_g', 'bc_pna', 'age_corrected')]   # exclude any we don't want to make factors
+targets[col_names] <- lapply(targets[col_names] , factor)
+glimpse(targets)
+
+## add categorical variables to bucket gestational age, post natal age, and corrected age in to groupings
+
+targets$gest_age_group <- cut(
+  targets$gest_age_days,
+  breaks = c(0, 170, 180, 190, Inf),
+  labels = c("below_170", "170_180", "180_190", "above_190"),
+  right  = TRUE
+)
+
+targets$gest_age_group <- factor(targets$gest_age_group, levels = c("below_170", "170_180", "180_190", "above_190"))
+
+
+targets$pna_group <- cut(
+  targets$bc_pna,
+  breaks = c(0, 10, 20, 30, Inf),
+  labels = c("below_10", "10_20", "20_30", "above_30"),
+  right  = TRUE
+)
+
+targets$pna_group <- factor(targets$pna_group, levels = c("below_10", "10_20", "20_30", "above_30"))
+
+
+targets$age_corrected_group <- cut(
+  targets$age_corrected,
+  breaks = c(0, 180, 200, 220, 240, Inf),
+  labels = c("below_180", "180_200", "200_220", "220_240", "above_240"),
+  right  = TRUE
+)
+
+targets$age_corrected_group <- factor(targets$age_corrected_group, levels = c("below_180", "180_200", "200_220", "220_240", "above_240"))
+
+
+
+## check the order of the targets files and input counts file are identical
+
+if (!identical(as.character(targets$analysisID), colnames(countsData))) {stop()}
+
+```
+
+========================================= Sample Condition Filter ============================================
+
+```{r filter raw data based on the chosen conditions for analysis}
+
+# set conditions to include
+conditions_filter <- c('control', 'sepsis')
+
+# selected samples to compare based on the included conditions
+targets <- targets %>% dplyr::filter(condition %in% conditions_filter)
+
+# remove unused factors from the factor levels
+targets$condition <- factor(targets$condition, levels = conditions_filter)
+
+#length(targets$analysisID)
+
+## filter the counts dataset by selected samples
+countsData <- countsData %>% dplyr::select(all_of(targets$analysisID))
+#dim(countsData)
+
+# save the input data as R objects
+save(countsData, file=paste(data.path, "raw_counts.RData", sep=""))
+save(targets, file=paste(data.path, "targets.RData", sep=""))
+
+## csv alternative
+write.csv(targets, file=paste(data.path, "targets_preprocessed.csv", sep=""), row.names = TRUE)
+
+## retrieve from csv
+# targets <- as.data.frame(read.csv(file = paste(data.path, "targets_preprocessed.csv", sep=""), header=TRUE, check.names=F, row.names = 1))
+
+```
+
+============================================================================================================
+###########################################  Median-Ratio Scaling ##########################################
+============================================================================================================
+
+========================================= M-R Normalisation ================================================
+
+```{r median-ratio scaling}
+
+## create deseq dataset objects from raw counts, estimate size factors (scale), and extract raw and noramliseed counts as matrix
+
+analysisObject<- dds_object(countsData, targets) %>% estimateSizeFactors()
+rawCounts <- counts(analysisObject, normalized = FALSE)
+normalisedCounts <- counts(analysisObject, normalized = TRUE)
+if (!identical(rownames(rawCounts), rownames(normalisedCounts))) { stop() }
+
+# save normalisedCounts matrix
+save(normalisedCounts, file=paste(data.path, "norm_counts.RData", sep=""))
+```
+
+============================================================================================================
+###########################     Statistical Transformation: Unfiltered     #################################
+============================================================================================================
+
+```{r vst transformation unfiltered counts}
+
+## shifted log2 transform, use the m-r scaled data
+logNormCount<- log2(normalisedCounts + 1)
+
+## vst (includes median-ratio scaling and log2 transformation)
+vstNormalisedCounts <- vst_transform(countsData, targets)
+
+if (!identical(rownames(rawCounts), rownames(vstNormalisedCounts))) { stop() }
+```
+
+```{r rlog transformation unfiltered counts}
+
+## rlog transformation (includes median-ratio scaling and log2 transformation)
+rlogNormalisedCounts <- rlog_transform(countsData, targets)
+
+if (!identical(rownames(rawCounts), rownames(rlogNormalisedCounts))) { stop() }
+
+# save dataframe as an R object and csv given long run times
+
+save(rlogNormalisedCounts, file=paste(data.path, "rlog_counts.RData", sep=""))
+write.csv(rlogNormalisedCounts, file=paste(data.path, "rlog_counts.csv", sep=""), row.names = TRUE)
+
+## retrive from csv
+#rlogNormalisedCounts <- as.matrix(read.csv(file = "../output/v2/rlog_counts.csv", header=TRUE, check.names=F, row.names = 1))
+```
+
+============================================================================================================
+########################################### SAMPLE QA: UNFILTERED ##########################################
+============================================================================================================
+
+===================================== Sex labelling check  ==================================
+
+Check the expression/ counts of a basket of y-linked genes - the genes on the y-chromosome. PCA should clearly cluster male/ female.
+
+```{r sex confirmation}
+## filter the transformed counts on subset of ensembl y liniked genes and run a PCA with sex labels
+
+y_linked_genes <- read.table("../resources/y_linked_genes.txt", sep=",", header=T)
+y_linked_gene_names <- c('EIF1AY', 'SMCY', 'ZFY', 'UTY', 'DDX3Y', 'USP9Y')
+
+# note: could add XIST gene (ENSG00000229807) to the signature, and filter from the whole genome rather than just y chromosome. This is the protein that turns off one of the X chromosomes in females. This should be zero or close to zero in males.
+
+sex_confirm_pca_results <- calc_pca_results_gene_sig(rlogNormalisedCounts,
+                                                    targets,
+                                                    y_linked_genes,
+                                                    y_linked_gene_names,
+                                                    conditions_filter,
+                                                    n_pc=9)
+
+sex_confirm_pca_scree <- pca_scree_plot(sex_confirm_pca_results)
+
+sex_confirm_pca_plot <- pca_scatter_annotated(sex_confirm_pca_results, targets, sex)
+
+ggsave(filename = "pca.rlog.ylinkedcheck.jpg", plot = sex_confirm_pca_plot, dpi = 300, path = paste(figs.path, "qa_images/", sep=""))
+
+# annotate the dataframe of pca results to identify mis-classified points 
+sex_confirm_pca_annotated <- sex_confirm_pca_results$x %>%
+  as_tibble(rownames = "analysisID") %>%
+  arrange(desc(PC1)) %>%
+  merge(dplyr::select(targets, analysisID, sex), by="analysisID",  sort=FALSE)
+
+```
+
+
+================================= L1 Distance Between Samples =============================================
+
+Generate a normalised heatmap of the L1 distances between all samples in the data set
+Sum the L1 distance of each sample from all other samples to identify distant samples as potential outliers
+Identify outliers based on Tukey's method of outlier detection
+
+```{r l1 distanced unfiltered counts}
+
+# generate l1-distance qa outputs on rlog transformed counts output and save manually
+l1_heatmap <- l1_distance_heatmap(rlogNormalisedCounts, targets, condition)
+
+l1_outlier_output <- l1_distance_barchart(rlogNormalisedCounts, targets, condition)
+l1_outliers <- l1_outlier_output$dist_outliers
+l1_barchart <- l1_outlier_output$dist_barchart
+
+# save images
+ggsave(filename = "l1.heatmap.rlog.jpg", plot = l1_heatmap, dpi = 300, path = paste(figs.path, "qa_images/", sep=""))
+ggsave(filename = "l1.barchart.rlog.jpg", plot = l1_barchart , dpi = 300, path = paste(figs.path, "qa_images/", sep=""))
+
+```
+
+===================================== Distances Between Samples: PCA  ======================================
+
+PCA to help identify batch effects and the impact of confounding factors
+
+```{r pca analysis unfiltered counts}
+
+# generate PCA results using the full set of features with rlog normalised counts
+pca_results <- prcomp(t(rlogNormalisedCounts), center = TRUE, scale = FALSE, rank = 9)
+
+# view scree plot
+pca_scree_plot(pca_results)
+
+# loop through alternative PCA annotations and save pca scatter plots to jpeg files
+
+annotation_list = c("sex", "condition", "library_batch", "rna_blood_volume", "rin_value_below_6", "topUps", "counts_batch")
+
+for(anno in annotation_list){
+  pca_scatter <- pca_scatter_annotated(pca_results, targets, !!sym(anno))
+  ggsave(filename = paste("pca.rlog.", anno, ".jpg", sep=""),
+         plot = pca_scatter,
+         dpi = 300,
+         path = paste(figs.path, "qa_images/", sep=""))
+}
+```
+
+=================================== Array Count Distributions: K-S Statistic  ==================================
+
+Evaluation of whether the samples have a similar distribution same distribution, through box plots, density plots, and calculation of the K-S statistic for each array relative to an index of all samples.
+
+```{r ks statistic unfiltered counts}
+
+# generate output density plots on rlog normalised counts data
+
+density_output              <- box_density_k_s(rlogNormalisedCounts, targets, condition)  # ideally this is split into three functions
+(distribution_boxplot        <- density_output$box_plot)
+(distribution_density_plot   <- density_output$density_plot)
+(distribution_k_stat_bar     <- density_output$k_stat_bar)
+distribution_outliers       <- density_output$outliers
+
+# save images
+ggsave(filename = "boxplot.rlog.jpg", plot = distribution_boxplot, dpi = 300, path = paste(figs.path, "qa_images/", sep=""))
+ggsave(filename = "density_plot.rlog.jpg", plot = distribution_density_plot, dpi = 300, path = paste(figs.path, "qa_images/", sep=""))
+ggsave(filename = "kstatbar.rlog.jpg", plot = distribution_k_stat_bar, dpi = 300, path = paste(figs.path, "qa_images/", sep=""))
+
+```
+
+============================ Assay Quality: MA Plots, Hoeffding's D Statistic  ================================
+
+Assessment of the independence of log2 fold change and mean counts, through MA plots, and calculation of Hoeffding's D statistic for each sample vs. an index of all samples.
+
+```{r d statistic unfiltered counts}
+
+## calculate d-stats and plot MA plots for the rlog normalised counts
+d_stat_output     <- d_stat_function(rlogNormalisedCounts, targets, condition, 0.15)
+(d_stat_bar_chart  <- d_stat_output$d_stat_bar)
+ma_plots          <- ma_plots_function(rlogNormalisedCounts, d_stat_output$d_stats_df, 10, 10)
+(d_stat_outliers   <- d_stat_output$outliers)
+
+# save images
+ggsave(filename = "dstatbar.rlog.jpg", plot = d_stat_bar_chart, dpi = 300, path = paste(figs.path, "qa_images/", sep=""))
+ggsave(filename = "maplots.rlog.jpg", plot = ma_plots , dpi = 300, path = paste(figs.path, "qa_images/", sep=""))
+
+```
+
+===================================== Remove outliers from input data  ==================================
+
+Outliers defined as samples identified as outliers by at least 2 of the three statistical tests.
+
+```{r remove outliers unfiltered counts}
+
+# vector of identified outlier samples: select outliers that appear in at least 2 of the three statistical tests
+
+# outlier_samples <- c(intersect(l1_outlier_output$dist_outliers$analysisID,density_output$outliers$analysisID),
+#                     intersect(l1_outlier_output$dist_outliers$analysisID, d_stat_output$outliers$analysisID),
+#                     intersect(density_output$outliers$analysisID, d_stat_output$outliers$analysisID))
+
+#outlier_samples <-  c()
+  
+# remove any rows from the targets table, where the sample id is in the outliers vector 
+#targets.filtered <- targets[!targets$analysisID %in% outlier_samples, ]
+
+# remove any columns from the rawCounts table (i.e. the merged raw data) where sample id is in the outliers vector
+#countsData.filtered <- countsData.filtered[, !(names(countsData.filtered) %in% outlier_samples)]
+
+#dim(countsData.filtered)
+#dim(targets.filtered)
+```
+
